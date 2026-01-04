@@ -254,6 +254,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        ipc_queue: Optional[Any] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -261,6 +262,7 @@ class Scheduler(
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
+        self.ipc_queue = ipc_queue
         self.tp_size = server_args.tp_size
         self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
@@ -476,6 +478,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
+            ipc_queue=self.ipc_queue,
         )
 
         # Launch a draft worker for speculative decoding
@@ -2845,6 +2848,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    ipc_queue: Optional[Any] = None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2869,6 +2873,38 @@ def run_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+
+    logger.info("""================ Scheduler Process Started =================""")
+    logger.info(f"Server Args: {server_args}")
+    # IPC Tensor Transfer Demo
+    if ipc_queue is not None and tp_rank == 0 and pp_rank == 0:
+        try:
+            device = torch.device(f"cuda:{gpu_id}")
+            torch.cuda.set_device(device)
+            
+            if dp_rank == 0:
+                tensor = torch.ones((1024, 1024), device=device) * 42.0
+                logger.info(f"IPC Demo [DP0]: Created tensor on {device}")
+                ipc_queue.put(tensor)
+                logger.info(f"IPC Demo [DP0]: Sent tensor to queue")
+                msg = ipc_queue.get()
+                logger.info(f"IPC Demo [DP0]: Received: {msg}")
+
+            elif dp_rank == 1:
+                logger.info(f"IPC Demo [DP1]: Waiting for tensor")
+                received_tensor = ipc_queue.get()
+                logger.info(f"IPC Demo [DP1]: Received tensor on {received_tensor.device}")
+                local_tensor = received_tensor.to(device)
+                expected = torch.ones((1024, 1024), device=device) * 42.0
+                if torch.allclose(local_tensor, expected):
+                    logger.info("IPC Demo [DP1]: Tensor verification SUCCESS")
+                else:
+                    logger.error("IPC Demo [DP1]: Tensor verification FAILED")
+                ipc_queue.put("Done")
+
+
+        except Exception as e:
+            logger.error(f"IPC Demo Error: {e}")
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
@@ -2900,6 +2936,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            ipc_queue,
         )
         result_dict = {
             "status": "ready",

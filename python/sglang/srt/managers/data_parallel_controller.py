@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import psutil
 import setproctitle
@@ -247,6 +247,16 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
+
+        # Create IPC queue for demo if we have at least 2 DP workers
+        ipc_queue = None
+        if server_args.dp_size >= 2:
+            try:
+                ctx = mp.get_context('spawn')
+                ipc_queue = ctx.Queue()
+            except Exception as e:
+                logger.warning(f"Failed to create IPC queue: {e}")
+
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
@@ -262,7 +272,7 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event, ipc_queue),
             )
             threads.append(thread)
             base_gpu_id += (
@@ -294,8 +304,9 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
+        ipc_queue: Optional[Any] = None,
     ):
-        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
+        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank, None, ipc_queue)
         ready_event.set()
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
@@ -416,6 +427,7 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
+        ipc_queue: Optional[Any] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -480,6 +492,7 @@ class DataParallelController:
                             pp_rank,
                             dp_rank,
                             writer,
+                            ipc_queue,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(

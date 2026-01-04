@@ -218,12 +218,15 @@ class TpModelWorker(BaseTpWorker):
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         is_multi_layer_eagle: bool = False,
+        ipc_queue: Optional[Any] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+        self.dp_rank = dp_rank
+        self.ipc_queue = ipc_queue
 
         # MTP model runners
         self.model_runner_list = []
@@ -267,6 +270,7 @@ class TpModelWorker(BaseTpWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             draft_model_idx=0 if is_multi_layer_eagle else None,
+            ipc_queue=ipc_queue,
         )
         if is_multi_layer_eagle:
             self.model_runner_list.append(self.model_runner)
@@ -289,6 +293,7 @@ class TpModelWorker(BaseTpWorker):
                         req_to_token_pool=req_to_token_pool,
                         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
                         draft_model_idx=i,
+                        ipc_queue=ipc_queue,
                     )
                 )
         if server_args.skip_tokenizer_init:
