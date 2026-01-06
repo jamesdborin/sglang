@@ -839,12 +839,6 @@ class Qwen3MoeModel(Qwen2MoeModel):
         self.compute_stream = torch.cuda.current_stream()
         self.copy_stream    = torch.cuda.Stream()
 
-        self.copy_done    = [torch.cuda.Event(), torch.cuda.Event()]
-        self.compute_done = [torch.cuda.Event(), torch.cuda.Event()]
-        
-        for e in self.copy_done + self.compute_done:
-            e.record(torch.cuda.current_stream())
-
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -869,42 +863,75 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
-    def offload_experts(self, ipc_queue, dp_rank):
-        
+    def memory_snapshot(self):
+        # memory usage before offloading
+        alloc_start = torch.cuda.memory_allocated() / (1024**3)
+        resv_start  = torch.cuda.memory_reserved() / (1024**3)
+        return alloc_start, resv_start
+
+    def offload_experts(self, ipc_queue, dp_rank, gpu_id):
+        # TODO: split this into cpu_offload_experts and zerodp_offload_experts methods and dispatch accordingly.
         setattr(self.model, "dp_rank", dp_rank)
         if (self.model.num_offloaded_experts <= 0) and (not self.model.use_zerodp):
             logger.info(f"[DP {dp_rank}] No experts to offload to CPU memory and zeroDP is disabled.", dp_rank)
             return
 
         if self.model.use_zerodp:
-            
+            device = torch.device(f"cuda:{gpu_id}")
+            torch.cuda.set_device(device)
+
+            # memory usage of transfer
+            alloc_start = torch.cuda.memory_allocated() / (1024**3)
+            resv_start  = torch.cuda.memory_reserved() / (1024**3)
+
             if dp_rank == 0:
-                for idx, layer in enumerate(self.model.layers):
-                    tensor = layer.mlp.experts.w13_weight
-                    logger.info(f"IPC Demo [DP0]: Created tensor for layer {idx} on {tensor.device}")
-                    ipc_queue.put(tensor)
-                    logger.info(f"IPC Demo [DP0]: Sent tensor for layer {idx} to queue")
-                    msg = ipc_queue.get()
-                    logger.info(f"IPC Demo [DP0]: Received: {msg}")
+                send_stream = torch.cuda.Stream()
+                transfer_complete = torch.cuda.Event(interprocess=True)
+                
+                with torch.cuda.stream(send_stream):
+                    for idx, layer in enumerate(self.model.layers):
+                        tensor = layer.mlp.experts.w13_weight
+                        logger.info(f"[IPC Expert Transfer]: Created tensor for layer {idx} on {tensor.device}")
+                        ipc_queue.put(tensor)
+                        logger.info(f"[IPC Expert Transfer]: Sent tensor for layer {idx} to queue")
+
+                    send_stream.synchronize()
+                    transfer_complete.record(send_stream)
+                    ipc_queue.put(transfer_complete.ipc_handle())
+                    logger.info(f"[IPC Expert Transfer]: Sent transfer completion event to queue")
 
             elif dp_rank == 1:
                 for idx, layer in enumerate(self.model.layers):
-                    logger.info(f"IPC Demo [DP1]: Waiting for tensor for layer {idx}")
+                    logger.info(f"[IPC Expert Transfer]: Waiting for tensor for layer {idx}")
                     received_tensor = ipc_queue.get()
-                    logger.info(f"IPC Demo [DP1]: Received tensor for layer {idx} on {received_tensor.device}")
+                    logger.info(f"[IPC Expert Transfer]: Received tensor for layer {idx} from {received_tensor.device}")
                     # we store this tensor in "cpu_experts" to be consistent with the cpu-offloading codepath
                     # TODO: change this to a more appropriate name
                     if self.model.use_zerodp_full_offload:
                         layer.mlp.experts.cpu_experts = received_tensor
                     else:
                         layer.mlp.experts.cpu_experts = received_tensor[:self.model.num_offloaded_experts]
-                    ipc_queue.put(f"IPC Demo [DP1]: Ack layer {idx}")
 
-        if dp_rank == 1:
+                transfer_complete_event_ipc_handle = ipc_queue.get()
+                ready_evt = torch.cuda.Event.from_ipc_handle(torch.cuda.current_device(), transfer_complete_event_ipc_handle)
+                self.model.copy_stream.wait_event(ready_evt)
+
+            alloc_end = torch.cuda.memory_allocated() / (1024**3)
+            resv_end  = torch.cuda.memory_reserved() / (1024**3)
+
+            logger.info(f"[DP {dp_rank}] After receiving experts via IPC:")
+            logger.info(
+                f"[DP {dp_rank}] Increased allocation by {alloc_end - alloc_start:.2f} GB "
+                f"and reservation by {resv_end - resv_start:.2f} GB"
+            )
+        
+        del self._cached_params_dict
+        del self.routed_experts_weights_of_layer
+
+        # either we are rank 1 in zerodp, or we are doing cpu offloading. 
+        if (dp_rank == 1) or ((not self.model.use_zerodp) and (self.model.num_offloaded_experts > 0)):
             # we need to delete these because they hold references to expert weights, preventing us
             # from freeing the GPU memory.
-            del self._cached_params_dict
-            del self.routed_experts_weights_of_layer
             
             expert_shape = self.model.layers[0].mlp.experts.w13_weight.shape[1:]
             total_experts = self.model.layers[0].mlp.experts.num_experts
@@ -914,45 +941,47 @@ class Qwen3MoeForCausalLM(nn.Module):
             resv_start  = torch.cuda.memory_reserved() / (1024**3)
 
             # create a pair of ping-pong buffers to hold the experts temporarily
-            logger.info("[DP 1] Creating ping-pong buffers for expert offloading")
+            logger.info(f"[DP {dp_rank}] Creating ping-pong buffers for expert offloading")
             self.model.combined = [
                 torch.empty_like(self.model.layers[0].mlp.experts.w13_weight.data, requires_grad=False),
                 torch.empty_like(self.model.layers[0].mlp.experts.w13_weight.data, requires_grad=False),
             ]
 
-            logger.info("[DP 1] Initializing ping-pong buffers with expert weights")
+            logger.info(f"[DP {dp_rank}] Initializing ping-pong buffers with expert weights")
 
             with torch.no_grad():
                 self.model.combined[0].copy_(self.model.layers[0].mlp.experts.w13_weight)
                 self.model.combined[1].copy_(self.model.layers[1].mlp.experts.w13_weight)
 
-            logger.info("[DP 1] Moving experts from GPU to CPU")
+            logger.info(f"[DP {dp_rank}] Moving experts from GPU to CPU")
 
             for idx, layer in enumerate(self.model.layers):
                 with torch.no_grad():
                     
-                    w = layer.mlp.experts.w13_weight  # keep a local ref
+                    # # with zerodp we don't offload experts to CPU, they are stored on another rank.
+                    # if not self.model.use_zerodp:
+                    #     logger.info("Creating CPU tensor and copying offloaded experts to CPU")
+                    #     layer.mlp.experts.cpu_experts = torch.empty(
+                    #         (self.model.num_offloaded_experts, *expert_shape),
+                    #         dtype=w.dtype,
+                    #         device="cpu",
+                    #         pin_memory=True,
+                    #     )
+                    #     layer.mlp.experts.cpu_experts.copy_(w[:self.model.num_offloaded_experts].to("cpu", non_blocking=True))
+
+                    # # if we are using zeroDP we have created the cpu_experts tensor already above 
+                    # if not self.model.use_zerodp_full_offload:
+                    #     logger.info("Creating GPU tensor and copying remaining experts to GPU")
+                    #     # we might just want to offload the entire tensor in which case we don't create a smaller GPU tensor
+                    #     layer.mlp.experts.gpu_experts = torch.empty(
+                    #         (total_experts - self.model.num_offloaded_experts, *expert_shape),
+                    #         dtype=w.dtype,
+                    #         device=w.device,
+                    #     )
+                    #     layer.mlp.experts.gpu_experts = w[self.model.num_offloaded_experts:].clone()  # point to remaining GPU experts
                     
-                    # with zerodp we don't offload experts to CPU, they are stored on another rank.
-                    if not self.model.use_zerodp:
+                    w = layer.mlp.experts.w13_weight  # keep a local ref
 
-                        layer.mlp.experts.cpu_experts = torch.empty(
-                            (self.model.num_offloaded_experts, *expert_shape),
-                            dtype=w.dtype,
-                            device="cpu",
-                            pin_memory=True,
-                        )
-                        layer.mlp.experts.cpu_experts.copy_(w[:self.model.num_offloaded_experts].to("cpu", non_blocking=True))
-
-                    # if we are using zeroDP we have created the cpu_experts tensor already above 
-                    if not self.model.use_zerodp_full_offload:
-                        # we might just want to offload the entire tensor in which case we don't create a smaller GPU tensor
-                        layer.mlp.experts.gpu_experts = torch.empty(
-                            (total_experts - self.model.num_offloaded_experts, *expert_shape),
-                            dtype=w.dtype,
-                            device=w.device,
-                        )
-                        layer.mlp.experts.gpu_experts = w[self.model.num_offloaded_experts:].clone()  # point to remaining GPU experts
                     # remove original weight from module registry then drop ref
                     if 'w13_weight' in layer.mlp.experts._parameters:
                         del layer.mlp.experts._parameters['w13_weight']
@@ -964,25 +993,26 @@ class Qwen3MoeForCausalLM(nn.Module):
                     torch.cuda.synchronize()
                     import gc; gc.collect()
                     torch.cuda.empty_cache()
-                
+
             alloc_after = torch.cuda.memory_allocated() / (1024**3)
             resv_after  = torch.cuda.memory_reserved() / (1024**3)
 
-            logger.info("[DP 1] After offloading experts to CPU:")
+            logger.info(f"[DP {dp_rank}] After offloading experts:")
             logger.info(
-                f"[DP 1] Freed {alloc_start - alloc_after:.2f} GB "
+                f"[DP {dp_rank}] Freed {alloc_start - alloc_after:.2f} GB "
                 f"and reserved {resv_start - resv_after:.2f} GB"
             )
             new_tokens = (alloc_start - alloc_after) / (2*self.config.head_dim * self.config.num_key_value_heads * self.config.num_hidden_layers / 1024**3)
-            logger.info(f"[DP 1] Equivalent to {new_tokens:.2f} new tokens capacity.")
-
+            logger.info(f"[DP {dp_rank}] Equivalent to {new_tokens:.2f} new tokens capacity.")
             # now set the expert weights to point to the ping-pong buffers for the first two layers
             self.model.layers[0].mlp.experts.w13_weight = self.model.combined[0]
 
-            logger.info("[DP 1]: Expert offloading completed.")
-        if dp_rank == 0:
-            logger.info("[DP 0]: Not offloading experts, skipping.")
-    
+            logger.info(f"[DP {dp_rank}]: Expert offloading completed.")
+
+        # skip offloading on 0th dp rank with zeroDP
+        if dp_rank == 0 and (self.model.use_zerodp):
+            logger.info(f"[DP {dp_rank}]: Not offloading experts, skipping.")
+        torch.cuda.synchronize()
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 

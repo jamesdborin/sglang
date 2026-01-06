@@ -86,6 +86,57 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+# 1. Define the C++ Source
+cpp_source = """
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+
+// This function bypasses ATen's stream dependency checks
+void raw_p2p_copy(torch::Tensor& dst, const torch::Tensor& src) {
+    
+    // Basic safety checks
+    TORCH_CHECK(dst.is_cuda(), "dst must be a CUDA tensor");
+    TORCH_CHECK(src.is_cuda(), "src must be a CUDA tensor");
+    TORCH_CHECK(dst.is_contiguous(), "dst must be contiguous");
+    TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
+    TORCH_CHECK(dst.nbytes() == src.nbytes(), "Size mismatch: dst and src bytes must match");
+
+    void* dst_ptr = dst.data_ptr();
+    void* src_ptr = src.data_ptr();
+    size_t size = dst.nbytes();
+
+    // Get the stream that PyTorch is currently using (this handles capture context)
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Issue the raw CUDA command
+    // cudaMemcpyDeviceToDevice handles P2P automatically if enable_peer_access was called
+    cudaError_t err = cudaMemcpyAsync(
+        dst_ptr, 
+        src_ptr, 
+        size, 
+        cudaMemcpyDeviceToDevice, 
+        stream
+    );
+
+    if (err != cudaSuccess) {
+        TORCH_CHECK(false, "CUDA P2P Copy Error: ", cudaGetErrorString(err));
+    }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("raw_p2p_copy", &raw_p2p_copy, "Raw P2P Copy for Graph Capture");
+}
+"""
+
+# 2. Compile and Load
+# This might take a few seconds the first time it runs
+p2p_ops = load_inline(
+    name='p2p_utils',
+    cpp_sources=cpp_source,
+    functions=['raw_p2p_copy'],
+    verbose=True
+)
 
 class Qwen2MoeMLP(nn.Module):
     def __init__(
@@ -590,7 +641,9 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
-            if self.dp_rank == 1 or not self.use_zerodp:
+            # TODO: clean this up, perhaps use context manager which creates events/streams, and handles
+            # waiting and cleanup at the end. And more cleanly handles cpu offloading vs zerodp cases..
+            if (self.dp_rank == 1) or (not self.use_zerodp):
                 if (self.num_offloaded_experts > 0):
                     copy_done    = [torch.cuda.Event(), torch.cuda.Event()]
                     compute_done = [torch.cuda.Event(), torch.cuda.Event()]
@@ -606,7 +659,7 @@ class Qwen2MoeModel(nn.Module):
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    if (self.dp_rank == 1) or not self.use_zerodp:
+                    if (self.dp_rank == 1) or (not self.use_zerodp):
             
                         if self.num_offloaded_experts > 0:
                             next_layer_idx = (i + 1) % self.end_layer
