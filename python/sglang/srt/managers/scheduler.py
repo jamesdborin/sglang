@@ -2874,38 +2874,6 @@ def run_scheduler_process(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
-    logger.info("""================ Scheduler Process Started =================""")
-    logger.info(f"Server Args: {server_args}")
-    # IPC Tensor Transfer Demo
-    if ipc_queue is not None and tp_rank == 0 and pp_rank == 0:
-        try:
-            device = torch.device(f"cuda:{gpu_id}")
-            torch.cuda.set_device(device)
-            
-            if dp_rank == 0:
-                tensor = torch.ones((1024, 1024), device=device) * 42.0
-                logger.info(f"IPC Demo [DP0]: Created tensor on {device}")
-                ipc_queue.put(tensor)
-                logger.info(f"IPC Demo [DP0]: Sent tensor to queue")
-                msg = ipc_queue.get()
-                logger.info(f"IPC Demo [DP0]: Received: {msg}")
-
-            elif dp_rank == 1:
-                logger.info(f"IPC Demo [DP1]: Waiting for tensor")
-                received_tensor = ipc_queue.get()
-                logger.info(f"IPC Demo [DP1]: Received tensor on {received_tensor.device}")
-                local_tensor = received_tensor.to(device)
-                expected = torch.ones((1024, 1024), device=device) * 42.0
-                if torch.allclose(local_tensor, expected):
-                    logger.info("IPC Demo [DP1]: Tensor verification SUCCESS")
-                else:
-                    logger.error("IPC Demo [DP1]: Tensor verification FAILED")
-                ipc_queue.put("Done")
-
-
-        except Exception as e:
-            logger.error(f"IPC Demo Error: {e}")
-
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(
