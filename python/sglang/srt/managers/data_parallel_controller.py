@@ -15,7 +15,7 @@
 
 import faulthandler
 import logging
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import signal
 import threading
 import time
