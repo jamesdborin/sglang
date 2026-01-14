@@ -253,8 +253,8 @@ class DataParallelController:
         if server_args.dp_size >= 2:
             try:
                 ctx = mp.get_context("spawn")
-                num_ep_queues = max(server_args.ep_size, 1)
-                ipc_queues = [ctx.Queue() for _ in range(num_ep_queues)]
+                num_parallel_queues = server_args.tp_size
+                ipc_queues = [ctx.Queue() for _ in range(num_parallel_queues)]
             except Exception as e:
                 logger.warning(f"Failed to create IPC queues: {e}")
 
@@ -485,7 +485,7 @@ class DataParallelController:
                 ipc_queue = None
                 if ipc_queues is not None:
                     if moe_ep_rank < len(ipc_queues):
-                        ipc_queue = ipc_queues[moe_ep_rank]
+                        ipc_queue = ipc_queues[tp_rank]
                     else:
                         logger.warning(
                             "ipc_queues missing entry for EP rank %s; using first queue",
