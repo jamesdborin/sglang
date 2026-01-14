@@ -934,7 +934,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             # from freeing the GPU memory.
             
             expert_shape = self.model.layers[0].mlp.experts.w13_weight.shape[1:]
-            total_experts = self.model.layers[0].mlp.experts.num_experts
+            total_experts = self.model.layers[0].mlp.experts.num_local_experts
             
             # memory usage before offloading
             alloc_start = torch.cuda.memory_allocated() / (1024**3)
@@ -957,38 +957,14 @@ class Qwen3MoeForCausalLM(nn.Module):
 
             for idx, layer in enumerate(self.model.layers):
                 with torch.no_grad():
-                    
-                    # # with zerodp we don't offload experts to CPU, they are stored on another rank.
-                    # if not self.model.use_zerodp:
-                    #     logger.info("Creating CPU tensor and copying offloaded experts to CPU")
-                    #     layer.mlp.experts.cpu_experts = torch.empty(
-                    #         (self.model.num_offloaded_experts, *expert_shape),
-                    #         dtype=w.dtype,
-                    #         device="cpu",
-                    #         pin_memory=True,
-                    #     )
-                    #     layer.mlp.experts.cpu_experts.copy_(w[:self.model.num_offloaded_experts].to("cpu", non_blocking=True))
-
-                    # # if we are using zeroDP we have created the cpu_experts tensor already above 
-                    # if not self.model.use_zerodp_full_offload:
-                    #     logger.info("Creating GPU tensor and copying remaining experts to GPU")
-                    #     # we might just want to offload the entire tensor in which case we don't create a smaller GPU tensor
-                    #     layer.mlp.experts.gpu_experts = torch.empty(
-                    #         (total_experts - self.model.num_offloaded_experts, *expert_shape),
-                    #         dtype=w.dtype,
-                    #         device=w.device,
-                    #     )
-                    #     layer.mlp.experts.gpu_experts = w[self.model.num_offloaded_experts:].clone()  # point to remaining GPU experts
-                    
-                    w = layer.mlp.experts.w13_weight  # keep a local ref
+                                        
+                    del layer.mlp.experts.w13_weight  # keep a local ref
 
                     # remove original weight from module registry then drop ref
                     if 'w13_weight' in layer.mlp.experts._parameters:
                         del layer.mlp.experts._parameters['w13_weight']
                     elif 'w13_weight' in layer.mlp.experts._buffers:
                         del layer.mlp.experts._buffers['w13_weight']
-                    
-                    del w
                     
                     torch.cuda.synchronize()
                     import gc; gc.collect()
