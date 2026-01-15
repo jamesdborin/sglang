@@ -1317,12 +1317,12 @@ def pytorch_profile(name, func, *args, data_size=-1):
     global step_counter
     os.makedirs("trace", exist_ok=True)
     with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        activities=[ProfilerActivity.CUDA],
         # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
         # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
     ) as prof:
         with record_function(name):
             with open(f"trace/size_{step_counter}.json", "w") as f:

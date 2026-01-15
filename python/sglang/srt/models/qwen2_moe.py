@@ -86,7 +86,6 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
-
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -120,9 +119,7 @@ class Qwen2MoeMLP(nn.Module):
             tp_size=tp_size,
         )
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(
@@ -133,9 +130,7 @@ class Qwen2MoeMLP(nn.Module):
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter)
         return x
 
 
@@ -154,8 +149,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
+                f"Tensor parallel size {self.tp_size} is greater than " f"the number of experts {config.num_experts}."
             )
 
         self.topk = TopK(
@@ -167,8 +161,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=config.num_experts_per_tok,
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_global_server_args().ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -191,11 +184,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if get_moe_a2a_backend().is_deepep() else {}),
             )
         else:
             self.shared_expert = None
@@ -213,17 +202,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
-            self.num_experts = (
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
-            )
+            self.num_experts = config.num_experts + get_global_server_args().ep_num_redundant_experts
             self.top_k = config.num_experts_per_tok
 
     def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-        ]
+        return [x.data for name, x in self.experts.named_parameters() if name not in ["correction_bias"]]
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
@@ -239,10 +222,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 else:
-                    shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
-                        * shared_output
-                    )
+                    shared_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
 
         return shared_output
 
@@ -305,14 +285,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        if (
-            self.alt_stream is not None
-            and hidden_states.shape[0] > 0
-            and get_is_capture_mode()
-        ):
-            final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
-            )
+        if self.alt_stream is not None and hidden_states.shape[0] > 0 and get_is_capture_mode():
+            final_hidden_states, shared_output = self.forward_normal_dual_stream(hidden_states)
         else:
             shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)
@@ -437,9 +411,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
+        dual_chunk_attention_config = getattr(config, "dual_chunk_attention_config", None)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -489,9 +461,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -526,20 +496,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(hidden_states, residual, forward_batch)
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(forward_batch)
 
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = self.layer_communicator.postprocess_layer(hidden_states, residual, forward_batch)
 
         return hidden_states, residual
 
@@ -629,6 +593,17 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
+            # TODO: clean this up, perhaps use context manager which creates events/streams, and handles
+            # waiting and cleanup at the end. And more cleanly handles cpu offloading vs zerodp cases..
+            if (self.num_offloaded_experts > 0):
+                if (self.dp_rank == 1) or (not self.use_zerodp):
+                    copy_done    = [torch.cuda.Event(), torch.cuda.Event()]
+                    compute_done = [torch.cuda.Event(), torch.cuda.Event()]
+                    compute_stream = torch.cuda.current_stream()
+                
+                    for e in copy_done + compute_done:
+                        e.record(torch.cuda.current_stream())
+
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
@@ -636,6 +611,34 @@ class Qwen2MoeModel(nn.Module):
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
+                    if self.num_offloaded_experts > 0:
+                        if (self.dp_rank == 1) or (not self.use_zerodp):
+                            next_layer_idx = (i + 1) % self.end_layer
+                            next_buf = next_layer_idx % 2
+                            this_buf = i % 2
+
+                            # 2) PREFETCH next layer after compute is enqueued
+                            with torch.cuda.stream(self.copy_stream):
+                                self.copy_stream.wait_event(compute_done[next_buf])   # don’t overwrite next_buf if it’s still in use
+                                next_moe = self.layers[next_layer_idx].mlp.experts
+
+                                # in zerodp this isn't on the CPU, its actually on another DP Rank.
+                                cpu_src = next_moe.cpu_experts
+                                combined_experts = self.combined[next_buf]
+
+                                if self.use_zerodp_full_offload:
+                                    # in full offload mode, all experts are offloadeds, so we copy them all
+                                    combined_experts.copy_(cpu_src, non_blocking=True)
+                                else:
+                                    # in partial offload mode, only copy the offloaded experts
+                                    combined_experts[:self.num_offloaded_experts].copy_(cpu_src, non_blocking=True)
+
+                                copy_done[next_buf].record(self.copy_stream)          # publish “next_buf ready”
+                                next_moe.w13_weight = combined_experts
+
+                            # 1) COMPUTE current layer first
+                            compute_stream.wait_event(copy_done[this_buf])   # ensure this layer’s experts are ready
+
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions,
@@ -648,6 +651,15 @@ class Qwen2MoeModel(nn.Module):
                             else None
                         ),
                     )
+
+                    if self.num_offloaded_experts > 0:
+                        if (self.dp_rank == 1) or (not self.use_zerodp):
+                            compute_done[this_buf].record(compute_stream)    # publish “buffer this_buf no longer in use”
+
+            if self.num_offloaded_experts > 0:
+                if (self.dp_rank == 1) or (not self.use_zerodp):
+                    torch.cuda.current_stream().wait_stream(self.copy_stream)
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -719,9 +731,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+            return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states)
         else:
             return hidden_states
 
@@ -755,14 +765,10 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
+            hidden_states, _ = self.model.norm(forward_batch.hidden_states, forward_batch.residual)
             forward_batch.hidden_states = hidden_states
             # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
+            result = self.logits_processor(input_ids, forward_batch.hidden_states, self.lm_head, forward_batch)
         else:
             result = None
 
@@ -799,10 +805,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
+                and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
             ):
                 continue
             if "rotary_emb.inv_freq" in name:
@@ -855,9 +858,7 @@ class Qwen2MoeForCausalLM(nn.Module):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")

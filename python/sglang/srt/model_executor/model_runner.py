@@ -24,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -276,6 +276,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         draft_model_idx: Optional[int] = None,
+        ipc_queue: Optional[Any] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -286,12 +287,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size
+        self.dp_rank = dp_rank
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.ipc_queue = ipc_queue
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
@@ -897,6 +900,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model = self.loader.load_model(
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
+                ipc_queue=self.ipc_queue,
+                dp_rank=self.dp_rank,
             )
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (

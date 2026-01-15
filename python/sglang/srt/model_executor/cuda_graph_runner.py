@@ -442,8 +442,8 @@ class CudaGraphRunner:
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
+            activities=[ProfilerActivity.CUDA],
+            record_shapes=False,
         )
         torch.cuda.memory._record_memory_history()
         return profile_context

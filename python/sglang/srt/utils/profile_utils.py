@@ -262,19 +262,16 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
     def start(self):
         activity_map = {
-            "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
         torchprof_activities = [
-            activity_map[a] for a in self.activities if a in activity_map
+            torch.profiler.ProfilerActivity.CUDA
         ]
 
         self.torch_profiler = torch.profiler.profile(
             activities=torchprof_activities,
-            with_stack=self.with_stack if self.with_stack is not None else True,
-            record_shapes=(
-                self.record_shapes if self.record_shapes is not None else False
-            ),
+            with_stack=False,
+            record_shapes=False,
             on_trace_ready=(
                 None
                 if not _is_npu

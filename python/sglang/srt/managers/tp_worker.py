@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any
 
 import torch
 
@@ -216,6 +216,7 @@ class TpModelWorker(BaseTpWorker):
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         is_multi_layer_eagle: bool = False,
+        ipc_queue: Optional[Any] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -226,6 +227,7 @@ class TpModelWorker(BaseTpWorker):
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
+        self.ipc_queue = ipc_queue
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -239,11 +241,55 @@ class TpModelWorker(BaseTpWorker):
         self._init_model_config()
         self._init_model_runner()
 
+        # Init DLLM algorithm
+        if server_args.dllm_algorithm is not None:
+            self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
+        else:
+            self.dllm_algorithm = None
+
+        self._model_runner = ModelRunner(
+            model_config=self.model_config,
+            mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            pp_rank=pp_rank,
+            pp_size=server_args.pp_size,
+            nccl_port=nccl_port,
+            dp_rank=dp_rank,
+            server_args=server_args,
+            is_draft_worker=is_draft_worker,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            draft_model_idx=0 if is_multi_layer_eagle else None,
+            ipc_queue=ipc_queue,
+        )
         if is_multi_layer_eagle:
-            self._init_multi_layer_eagle_model_runners()
-
-        self._init_dllm_algorithm()
-
+            self.model_runner_list.append(self.model_runner)
+            for i in range(1, server_args.speculative_num_steps):
+                self.model_runner_list.append(
+                    ModelRunner(
+                        model_config=self.model_config,
+                        mem_fraction_static=server_args.mem_fraction_static,
+                        gpu_id=gpu_id,
+                        tp_rank=tp_rank,
+                        tp_size=server_args.tp_size,
+                        moe_ep_rank=moe_ep_rank,
+                        moe_ep_size=server_args.ep_size,
+                        pp_rank=pp_rank,
+                        pp_size=server_args.pp_size,
+                        nccl_port=nccl_port,
+                        dp_rank=dp_rank,
+                        server_args=server_args,
+                        is_draft_worker=is_draft_worker,
+                        req_to_token_pool=req_to_token_pool,
+                        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                        draft_model_idx=i,
+                        ipc_queue=ipc_queue,
+                    )
+                )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:

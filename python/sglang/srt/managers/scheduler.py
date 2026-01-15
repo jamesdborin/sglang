@@ -258,6 +258,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        ipc_queue: Optional[Any] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -265,6 +266,7 @@ class Scheduler(
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
+        self.ipc_queue = ipc_queue
         self.tp_size = server_args.tp_size
         self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
@@ -480,6 +482,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
+            ipc_queue=self.ipc_queue,
         )
 
     def init_draft_worker(self):
@@ -2922,6 +2925,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    ipc_queue: Optional[Any] = None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2977,6 +2981,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            ipc_queue,
         )
         result_dict = {
             "status": "ready",

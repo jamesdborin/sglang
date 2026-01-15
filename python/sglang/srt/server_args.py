@@ -1532,7 +1532,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "GptOssForCausalLM",
                 "Glm4MoeForCausalLM",
-                "Qwen3MoeForCausalLM",
+                # "Qwen3MoeForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention

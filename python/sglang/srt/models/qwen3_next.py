@@ -1,5 +1,6 @@
 import enum
 import logging
+import os
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -827,6 +828,7 @@ class Qwen3NextModel(nn.Module):
 
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
+        self.num_cpu_experts = int(os.environ.get("SGLANG_CPU_OFFLOAD_NUM_EXPERTS", 0))
 
     def forward(
         self,
@@ -846,9 +848,38 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = None
+
+        if self.num_cpu_experts > 0:
+            copy_done    = [torch.cuda.Event(), torch.cuda.Event()]
+            compute_done = [torch.cuda.Event(), torch.cuda.Event()]
+            compute_stream = torch.cuda.current_stream()
+            
+            for e in copy_done + compute_done:
+                e.record(torch.cuda.current_stream())
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
+                if self.num_cpu_experts > 0:
+                    next_layer_idx = (i + 1) % len(self.layers)
+                    next_buf = next_layer_idx % 2
+                    this_buf = i % 2
+
+                    # 2) PREFETCH next layer after compute is enqueued
+                    with torch.cuda.stream(self.copy_stream):
+                        self.copy_stream.wait_event(compute_done[next_buf])   # don’t overwrite next_buf if it’s still in use
+                        next_moe = self.layers[next_layer_idx].mlp.experts
+                        cpu_src = next_moe.cpu_experts
+                        combined_experts = self.combined[next_buf]
+
+                        combined_experts[:self.num_cpu_experts].copy_(cpu_src, non_blocking=True)
+
+                        copy_done[next_buf].record(self.copy_stream)          # publish “next_buf ready”
+                        next_moe.w13_weight = combined_experts
+
+                    # 1) COMPUTE current layer first
+                    compute_stream.wait_event(copy_done[this_buf])   # ensure this layer’s experts are ready
+
                 hidden_states, residual = layer(
                     layer_id=i,
                     positions=positions,
@@ -856,6 +887,12 @@ class Qwen3NextModel(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                 )
+
+                if self.num_cpu_experts > 0:
+                    compute_done[this_buf].record(compute_stream)    # publish “buffer this_buf no longer in use”
+            
+        if self.num_cpu_experts > 0:
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -937,6 +974,94 @@ class Qwen3NextForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    
+    def offload_experts_to_cpu(self):
+        if self.model.num_cpu_experts <= 0:
+            logger.info("No experts to offload to CPU memory.")
+            return
+        
+        # we need to delete these because they hold references to expert weights, preventing us
+        # from freeing the GPU memory.
+        del self._cached_params_dict
+        del self.routed_experts_weights_of_layer
+
+        logger.info(
+            "Offloading MoE experts to CPU memory for layer "
+            f"range [{self.model.start_layer}, {self.model.end_layer})"
+        )
+        expert_shape = self.model.layers[0].mlp.experts.w13_weight.shape[1:]
+        total_experts = self.model.layers[0].mlp.experts.num_experts
+        
+        # memory usage before offloading
+        alloc_start = torch.cuda.memory_allocated() / (1024**3)
+        resv_start  = torch.cuda.memory_reserved() / (1024**3)
+
+        # create a pair of ping-pong buffers to hold the experts temporarily
+        logger.info("Creating ping-pong buffers for expert offloading")
+        self.model.combined = [
+            torch.empty_like(self.model.layers[0].mlp.experts.w13_weight.data, requires_grad=False),
+            torch.empty_like(self.model.layers[0].mlp.experts.w13_weight.data, requires_grad=False),
+        ]
+
+        logger.info("Initializing ping-pong buffers with expert weights")
+
+        with torch.no_grad():
+            self.model.combined[0].copy_(self.model.layers[0].mlp.experts.w13_weight)
+            self.model.combined[1].copy_(self.model.layers[1].mlp.experts.w13_weight)
+
+        logger.info("Moving experts from GPU to CPU")
+
+        for idx, layer in enumerate(self.model.layers):
+            with torch.no_grad():
+                w = layer.mlp.experts.w13_weight  # keep a local ref
+
+                layer.mlp.experts.cpu_experts = torch.empty(
+                    (self.model.num_cpu_experts, *expert_shape),
+                    dtype=w.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                layer.mlp.experts.gpu_experts = torch.empty(
+                    (total_experts - self.model.num_cpu_experts, *expert_shape),
+                    dtype=w.dtype,
+                    device=w.device,
+                )
+
+                # copy into preallocated tensors (NO extra allocations)
+                layer.mlp.experts.cpu_experts.copy_(w[:self.model.num_cpu_experts].to("cpu", non_blocking=True))
+                layer.mlp.experts.gpu_experts = w[self.model.num_cpu_experts:].clone()  # point to remaining GPU experts
+
+                # remove original weight from module registry then drop ref
+                if 'w13_weight' in layer.mlp.experts._parameters:
+                    del layer.mlp.experts._parameters['w13_weight']
+                elif 'w13_weight' in layer.mlp.experts._buffers:
+                    del layer.mlp.experts._buffers['w13_weight']
+                
+                del w
+                
+                torch.cuda.synchronize()
+                import gc; gc.collect()
+                torch.cuda.empty_cache()
+            
+        alloc_after = torch.cuda.memory_allocated() / (1024**3)
+        resv_after  = torch.cuda.memory_reserved() / (1024**3)
+
+        logger.info("After offloading experts to CPU:")
+        logger.info(
+            f"Freed {alloc_start - alloc_after:.2f} GB "
+            f"and reserved {resv_start - resv_after:.2f} GB"
+        )
+        new_tokens = (alloc_start - alloc_after) / (self.config.head_dim * self.config.num_key_value_heads * self.config.num_hidden_layers / 1024**3)
+        logger.info(f"Equivalent to {new_tokens:.2f} new tokens capacity.")
+
+        # now set the expert weights to point to the ping-pong buffers for the first two layers
+        self.model.layers[0].mlp.experts.w13_weight = self.model.combined[0]
+
+        torch.cuda.synchronize()
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
+
+        logger.info("Expert offloading to CPU completed.")
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
