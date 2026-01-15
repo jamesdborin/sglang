@@ -593,16 +593,14 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
-            # TODO: clean this up, perhaps use context manager which creates events/streams, and handles
-            # waiting and cleanup at the end. And more cleanly handles cpu offloading vs zerodp cases..
-            if (self.num_offloaded_experts > 0):
-                if (self.dp_rank == 1) or (not self.use_zerodp):
-                    copy_done    = [torch.cuda.Event(), torch.cuda.Event()]
-                    compute_done = [torch.cuda.Event(), torch.cuda.Event()]
-                    compute_stream = torch.cuda.current_stream()
-                
-                    for e in copy_done + compute_done:
-                        e.record(torch.cuda.current_stream())
+            # Create events on the ZeroDP rank to orchestrate overlapping loading and computation
+            if (self.dp_rank == 1):
+                copy_done    = [torch.cuda.Event(), torch.cuda.Event()]
+                compute_done = [torch.cuda.Event(), torch.cuda.Event()]
+                compute_stream = torch.cuda.current_stream()
+            
+                for e in copy_done + compute_done:
+                    e.record(torch.cuda.current_stream())
 
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
@@ -611,33 +609,28 @@ class Qwen2MoeModel(nn.Module):
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    if self.num_offloaded_experts > 0:
-                        if (self.dp_rank == 1) or (not self.use_zerodp):
-                            next_layer_idx = (i + 1) % self.end_layer
-                            next_buf = next_layer_idx % 2
-                            this_buf = i % 2
+                    if (self.dp_rank == 1):
+                        next_layer_idx = (i + 1) % self.end_layer
+                        next_buf = next_layer_idx % 2
+                        this_buf = i % 2
 
-                            # 2) PREFETCH next layer after compute is enqueued
-                            with torch.cuda.stream(self.copy_stream):
-                                self.copy_stream.wait_event(compute_done[next_buf])   # don’t overwrite next_buf if it’s still in use
-                                next_moe = self.layers[next_layer_idx].mlp.experts
+                        # 2) PREFETCH next layer after compute is enqueued
+                        with torch.cuda.stream(self.copy_stream):
+                            self.copy_stream.wait_event(compute_done[next_buf])   # don’t overwrite next_buf if it’s still in use
+                            next_moe = self.layers[next_layer_idx].mlp.experts
 
-                                # in zerodp this isn't on the CPU, its actually on another DP Rank.
-                                cpu_src = next_moe.cpu_experts
-                                combined_experts = self.combined[next_buf]
+                            # in zerodp this isn't on the CPU, its actually on another DP Rank.
+                            source_src = next_moe.source_experts
+                            combined_experts = self.combined[next_buf]
 
-                                if self.use_zerodp_full_offload:
-                                    # in full offload mode, all experts are offloadeds, so we copy them all
-                                    combined_experts.copy_(cpu_src, non_blocking=True)
-                                else:
-                                    # in partial offload mode, only copy the offloaded experts
-                                    combined_experts[:self.num_offloaded_experts].copy_(cpu_src, non_blocking=True)
+                            # in full offload mode, all experts are offloadeds, so we copy them all
+                            combined_experts.copy_(source_src, non_blocking=True)
 
-                                copy_done[next_buf].record(self.copy_stream)          # publish “next_buf ready”
-                                next_moe.w13_weight = combined_experts
+                            copy_done[next_buf].record(self.copy_stream)          # publish “next_buf ready”
+                            next_moe.w13_weight = combined_experts
 
-                            # 1) COMPUTE current layer first
-                            compute_stream.wait_event(copy_done[this_buf])   # ensure this layer’s experts are ready
+                        # 1) COMPUTE current layer first
+                        compute_stream.wait_event(copy_done[this_buf])   # ensure this layer’s experts are ready
 
                     layer = self.layers[i]
                     hidden_states, residual = layer(
@@ -652,13 +645,11 @@ class Qwen2MoeModel(nn.Module):
                         ),
                     )
 
-                    if self.num_offloaded_experts > 0:
-                        if (self.dp_rank == 1) or (not self.use_zerodp):
-                            compute_done[this_buf].record(compute_stream)    # publish “buffer this_buf no longer in use”
+                    if (self.dp_rank == 1):
+                        compute_done[this_buf].record(compute_stream)    # publish “buffer this_buf no longer in use”
 
-            if self.num_offloaded_experts > 0:
-                if (self.dp_rank == 1) or (not self.use_zerodp):
-                    torch.cuda.current_stream().wait_stream(self.copy_stream)
+            if (self.dp_rank == 1):
+                torch.cuda.current_stream().wait_stream(self.copy_stream)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

@@ -820,10 +820,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         # copy_ready[i]: recorded on _copy_stream after buffer i has been filled.
         # compute_done[i]: recorded on the compute stream after buffer i is no longer needed (safe to overwrite).
         # Initialize compute_done[i] as “done” once so the first prefetch can proceed.
-        self.num_offloaded_experts = int(os.environ.get("SGLANG_OFFLOAD_NUM_EXPERTS", 0))
         self.use_zerodp = int(os.environ.get("SGLANG_USE_ZERODP", 0)) > 0
-        self.use_zerodp_full_offload = self.num_offloaded_experts >= self.config.num_experts
-
         self.compute_stream = torch.cuda.current_stream()
         self.copy_stream    = torch.cuda.Stream()
 
@@ -860,7 +857,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     def offload_experts(self, ipc_queue, dp_rank, gpu_id):
         # TODO: split this into cpu_offload_experts and zerodp_offload_experts methods and dispatch accordingly.
         setattr(self.model, "dp_rank", dp_rank)
-        if (self.model.num_offloaded_experts <= 0) and (not self.model.use_zerodp):
+        if not self.model.use_zerodp:
             logger.info(f"[DP {dp_rank}] No experts to offload to CPU memory and zeroDP is disabled.", dp_rank)
             return
 
@@ -893,12 +890,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     logger.info(f"[IPC Expert Transfer]: Waiting for tensor for layer {idx}")
                     received_tensor = ipc_queue.get()
                     logger.info(f"[IPC Expert Transfer]: Received tensor for layer {idx} from {received_tensor.device}")
-                    # we store this tensor in "cpu_experts" to be consistent with the cpu-offloading codepath
-                    # TODO: change this to a more appropriate name
-                    if self.model.use_zerodp_full_offload:
-                        layer.mlp.experts.cpu_experts = received_tensor
-                    else:
-                        layer.mlp.experts.cpu_experts = received_tensor[:self.model.num_offloaded_experts]
+                    layer.mlp.experts.source_experts = received_tensor
 
                 transfer_complete_event_ipc_handle = ipc_queue.get()
                 ready_evt = torch.cuda.Event.from_ipc_handle(torch.cuda.current_device(), transfer_complete_event_ipc_handle)
