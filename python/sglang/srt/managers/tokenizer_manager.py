@@ -75,6 +75,7 @@ from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterM
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
+from sglang.srt.managers.utils import parse_ngram_guess
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
@@ -665,7 +666,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Tokenize
         input_embeds = None
         input_text = obj.text
+        ngram_guess_text = None
+        ngram_guess_ids = None
         token_type_ids = None
+        
+        # Parse NGRAMGUESS tags if present (for n-gram speculation)
+        if input_text and "<NGRAMGUESS>" in input_text:
+            input_text, ngram_guess_text = parse_ngram_guess(input_text)
+            if ngram_guess_text:
+                logger.debug(
+                    f"Parsed NGRAMGUESS from request {obj.rid}: "
+                    f"guess_text='{ngram_guess_text[:50]}...'" 
+                    if len(ngram_guess_text) > 50 else 
+                    f"guess_text='{ngram_guess_text}'"
+                )
+        
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -690,6 +705,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
+            )
+        
+        # Tokenize the guess if present
+        if ngram_guess_text and self.tokenizer is not None:
+            # Tokenize the guess separately
+            ngram_guess_ids, _ = await self._tokenize_texts(
+                ngram_guess_text, False  # Not cross-encoder
+            )
+            logger.debug(
+                f"Tokenized NGRAMGUESS for request {obj.rid}: "
+                f"{len(ngram_guess_ids)} tokens"
             )
 
         if self.mm_processor and obj.contains_mm_input():
@@ -739,7 +765,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self._validate_one_request(obj, input_ids)
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids,
+            ngram_guess_text, ngram_guess_ids
         )
 
     def _validate_one_request(
@@ -893,6 +920,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
+        ngram_guess_text: Optional[str] = None,
+        ngram_guess_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -940,6 +969,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
+                ngram_guess_text=ngram_guess_text,
+                ngram_guess_ids=ngram_guess_ids,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

@@ -60,6 +60,32 @@ class NGRAMWorker:
     def clear_cache_pool(self):
         self.ngram_cache.reset()
 
+    def add_guess_to_cache(self, prompt_ids: List[int], guess_ids: List[int]):
+        """Pre-populate cache with prompt + guess sequence.
+        
+        This allows users to provide expected continuations via <NGRAMGUESS> tags
+        that get cached before generation begins, improving speculation quality 
+        from the first token.
+        
+        Args:
+            prompt_ids: Token IDs of the prompt
+            guess_ids: Token IDs of the expected continuation
+        """
+        if not guess_ids:
+            logger.warning("add_guess_to_cache called with empty guess_ids")
+            return
+                
+        # Insert into cache
+        self.ngram_cache.batch_put([prompt_ids, guess_ids])
+        
+        # Synchronize to ensure it's available immediately
+        self.ngram_cache.synchronize()
+        
+        logger.debug(
+            f"Added NGRAMGUESS to cache: {len(prompt_ids)} prompt tokens + "
+            f"{len(guess_ids)} guess tokens (total: {len(prompt_ids) + len(guess_ids)} tokens)"
+        )
+
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
         if seq2_len >= n:

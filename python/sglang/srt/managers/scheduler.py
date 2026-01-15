@@ -1447,6 +1447,31 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # Handle NGRAMGUESS if present (for n-gram speculation)
+            if (
+                hasattr(recv_req, 'ngram_guess_ids') 
+                and recv_req.ngram_guess_ids is not None 
+                and len(recv_req.ngram_guess_ids) > 0
+                and self.spec_algorithm.is_ngram()
+            ):
+                # Add guess to n-gram cache before generation starts
+                # This improves speculation quality from the first token
+                self.model_worker.add_guess_to_cache(
+                    req.origin_input_ids,
+                    recv_req.ngram_guess_ids
+                )
+            elif (
+                hasattr(recv_req, 'ngram_guess_text') 
+                and recv_req.ngram_guess_text is not None 
+                and not self.spec_algorithm.is_ngram()
+            ):
+                # Warn if guess provided but not using NGRAM
+                logger.warning(
+                    f"NGRAMGUESS tags found in request {req.rid} but not using "
+                    f"NGRAM speculation (current: {self.spec_algorithm.name}). "
+                    f"Ignoring guess."
+                )
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:

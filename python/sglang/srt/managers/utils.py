@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional
+import re
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -176,3 +177,40 @@ def get_logprob_from_pp_outputs(
     ]
 
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
+
+
+def parse_ngram_guess(text: str) -> Tuple[str, Optional[str]]:
+    """
+    Parse <NGRAMGUESS> tags from input text for n-gram speculation.
+    
+    The guess text will be tokenized and added to the n-gram cache before
+    generation begins, improving speculation quality from the first token.
+    
+    Args:
+        text: Input text possibly containing <NGRAMGUESS>...</NGRAMGUESS>
+        
+    Returns:
+        (prompt, guess) tuple where:
+        - prompt: The cleaned input text with tags removed
+        - guess: The extracted guess text, or None if no tags found
+        
+    Examples:
+        >>> parse_ngram_guess("Hello<NGRAMGUESS>world</NGRAMGUESS>")
+        ("Hello", "world")
+        
+        >>> parse_ngram_guess("Hello world")
+        ("Hello world", None)
+        
+        >>> parse_ngram_guess("The capital of France is <NGRAMGUESS>Paris</NGRAMGUESS>")
+        ("The capital of France is ", "Paris")
+    """
+    pattern = r'<NGRAMGUESS>(.*?)</NGRAMGUESS>'
+    match = re.search(pattern, text, re.DOTALL)
+    
+    if match:
+        guess = match.group(1)
+        # Remove the tag and its contents from the original text
+        prompt = text[:match.start()] + text[match.end():]
+        return prompt, guess
+    
+    return text, None

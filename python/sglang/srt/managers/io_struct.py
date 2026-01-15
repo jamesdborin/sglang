@@ -761,6 +761,13 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
 
+    # N-gram speculation guess
+    # If provided, the guess text will be tokenized and added to the n-gram cache
+    # before generation begins, improving speculation quality from the first token.
+    # Tags: <NGRAMGUESS>expected output</NGRAMGUESS>
+    ngram_guess_text: Optional[str] = None
+    ngram_guess_ids: Optional[List[int]] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
