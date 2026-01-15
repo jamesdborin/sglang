@@ -597,7 +597,7 @@ class DefaultModelLoader(BaseModelLoader):
 
             self.load_weights_and_postprocess(model, self._get_all_weights(model_config, model), target_device)
         
-        if hasattr(model.model, "num_offloaded_experts") and model.model.num_offloaded_experts > 0:
+        if hasattr(model.model, "use_zerodp") and model.model.use_zerodp:
             model.offload_experts(ipc_queue=ipc_queue, dp_rank=dp_rank, gpu_id=device_config.gpu_id)
         
         return model.eval()
