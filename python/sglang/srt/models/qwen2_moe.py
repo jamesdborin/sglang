@@ -476,13 +476,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-            hidden_states,
-            residual,
-            forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+                **kwargs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
