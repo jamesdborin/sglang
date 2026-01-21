@@ -208,8 +208,8 @@ def parse_ngram_guess(text: str) -> Tuple[str, Optional[str]]:
     match = re.search(pattern, text, re.DOTALL)
     
     if match:
-        # prompt will always be first. 
-        prompt = match.group(0)
+        # Remove the tags from the original text to get the clean prompt
+        prompt = text[:match.start()] + text[match.end():]
         guess = match.group(1)
         return prompt, guess
     
