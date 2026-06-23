@@ -11,7 +11,7 @@ verification, or the speculative CUDA sampling kernel.
 
 ## Calibrate
 
-Launch a local server from this checkout and collect score quantiles:
+Launch a local server from this checkout and collect perplexity score quantiles:
 
 ```bash
 python lossy-spec-dec/eval_sweep.py \
@@ -33,8 +33,10 @@ python lossy-spec-dec/eval_sweep.py \
   --output-dir lossy-spec-dec/runs/calibrate
 ```
 
-Calibration writes JSONL records with chunk scores, normal accept length, and
-whether the configured threshold would pass.
+Calibration writes JSONL records with chunk perplexity scores, normal accept
+length, and whether the configured threshold would pass. Lower perplexity is
+better; a threshold of `1.0` only passes perfect chunks, and larger thresholds
+accept more chunks.
 
 ## Sweep
 
@@ -46,7 +48,7 @@ python lossy-spec-dec/eval_sweep.py \
   --mode sweep \
   --base-url http://127.0.0.1:30000 \
   --model-id <SERVED_MODEL_NAME> \
-  --thresholds 1.0,0.98,0.95,0.9 \
+  --thresholds 1.0,1.05,1.1,1.25 \
   --tasks gsm8k,humaneval \
   --output-dir lossy-spec-dec/runs/sweep \
   --nemo-command-template 'nemo-evaluator-launcher run --task {task} --endpoint-type openai --base-url {openai_base_url} --model {model_id} --output-dir {output_dir}'

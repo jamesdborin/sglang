@@ -2194,9 +2194,9 @@ class ServerArgs:
             self, "dflash_lossy_spec_score_histogram", None
         ) or [0] * 10
 
-        if not 0.0 <= self.dflash_lossy_spec_threshold <= 1.0:
+        if self.dflash_lossy_spec_threshold < 1.0:
             raise ValueError(
-                "--dflash-lossy-spec-threshold must be between 0 and 1."
+                "--dflash-lossy-spec-threshold must be at least 1.0."
             )
 
         if self.dflash_lossy_spec_mode != "off":
@@ -3552,7 +3552,7 @@ class ServerArgs:
         parser.add_argument(
             "--dflash-lossy-spec-threshold",
             type=float,
-            help="Accept the full linear DFlash draft chunk when exp(mean target logprob) is at least this threshold.",
+            help="Accept the full linear DFlash draft chunk when perplexity exp(-mean target logprob) is at most this threshold.",
             default=ServerArgs.dflash_lossy_spec_threshold,
         )
         parser.add_argument(

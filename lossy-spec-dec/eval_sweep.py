@@ -111,8 +111,8 @@ def set_dflash_state(
 def parse_thresholds(raw: str) -> List[float]:
     values = [float(item.strip()) for item in raw.split(",") if item.strip()]
     for value in values:
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"Threshold must be between 0 and 1: {value}")
+        if value < 1.0:
+            raise ValueError(f"Perplexity threshold must be at least 1.0: {value}")
     return values
 
 

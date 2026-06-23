@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 import time
 from typing import TYPE_CHECKING, Any
@@ -94,7 +95,7 @@ def _compute_linear_draft_scores_serial(
         torch.full_like(score_sums, float("-inf")),
     )
     scores = torch.where(
-        valid, torch.exp(mean_log_probs), torch.zeros_like(mean_log_probs)
+        valid, torch.exp(-mean_log_probs), torch.full_like(mean_log_probs, float("inf"))
     )
     return scores, mean_log_probs, path_lengths, valid, path_pairs, cur_cols
 
@@ -146,7 +147,7 @@ def _compute_linear_draft_scores_parallel(
         torch.full_like(score_sums, float("-inf")),
     )
     scores = torch.where(
-        valid, torch.exp(mean_log_probs), torch.zeros_like(mean_log_probs)
+        valid, torch.exp(-mean_log_probs), torch.full_like(mean_log_probs, float("inf"))
     )
     final_cols = path_lengths.to(torch.long)
     frozen_prev_cols = torch.minimum(prev_cols_batch, final_cols.unsqueeze(1))
@@ -179,7 +180,7 @@ def _record_dflash_lossy_batch(
     server_args.dflash_lossy_spec_forced_accept_count += int(sum(forced_accept_cpu))
     histogram = server_args.dflash_lossy_spec_score_histogram or [0] * 10
     for score in scores_cpu:
-        bucket = min(9, max(0, int(score * 10)))
+        bucket = 9 if not math.isfinite(score) else min(9, max(0, int(score) - 1))
         histogram[bucket] += 1
     server_args.dflash_lossy_spec_score_histogram = histogram
 
@@ -201,6 +202,7 @@ def _record_dflash_lossy_batch(
                 "mode": server_args.dflash_lossy_spec_mode,
                 "threshold": server_args.dflash_lossy_spec_threshold,
                 "score": score,
+                "perplexity": score,
                 "mean_logprob": mean_log_probs_cpu[i],
                 "path_len": int(path_lengths_cpu[i]),
                 "normal_accept_length": int(normal_accept_cpu[i]),
@@ -582,7 +584,7 @@ class EagleVerifyInputV2Mixin:
             )
             threshold_pass = (
                 valid_paths
-                & (scores >= get_global_server_args().dflash_lossy_spec_threshold)
+                & (scores <= get_global_server_args().dflash_lossy_spec_threshold)
             )
 
             if target_probs_for_lossy is None:
