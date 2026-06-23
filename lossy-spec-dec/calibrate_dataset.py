@@ -78,6 +78,22 @@ def request_generate(eval_sweep: Any, base_url: str, prompt: str, args: argparse
     return eval_sweep.request_json("POST", f"{base_url}/generate", json=payload)
 
 
+def wait_for_server_or_exit(eval_sweep: Any, base_url: str, timeout_s: int, process):
+    deadline = time.time() + timeout_s
+    last_error = None
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"SGLang server exited before becoming ready with code {process.returncode}"
+            )
+        try:
+            return eval_sweep.request_json("GET", f"{base_url}/server_info", timeout=5)
+        except Exception as exc:  # noqa: BLE001 - report the last connection error
+            last_error = exc
+            time.sleep(2)
+    raise RuntimeError(f"Timed out waiting for {base_url}: {last_error}")
+
+
 def iter_records(path: Path) -> Iterable[dict[str, Any]]:
     if not path.exists():
         return
@@ -177,7 +193,9 @@ def run_calibration(args: argparse.Namespace) -> Path:
     process = None
     try:
         process, base_url = eval_sweep.launch_server(server_args, calibration_output)
-        server_info = eval_sweep.wait_for_server(base_url, args.server_timeout)
+        server_info = wait_for_server_or_exit(
+            eval_sweep, base_url, args.server_timeout, process
+        )
         eval_sweep.validate_dflash_linear(server_info)
         if calibration_output.exists():
             calibration_output.unlink()
