@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -9,6 +12,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import sampling_from_probs_torch
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
@@ -48,6 +52,192 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+
+def _dflash_lossy_mode_enabled() -> bool:
+    return get_global_server_args().dflash_lossy_spec_mode != "off"
+
+
+def _compute_linear_draft_scores_serial(
+    candidates: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    log_probs: torch.Tensor,
+    spec_steps: int,
+):
+    bs = candidates.shape[0]
+    device = candidates.device
+    batch_idx = torch.arange(bs, device=device)
+    cur_cols = torch.zeros(bs, dtype=torch.long, device=device)
+    score_sums = torch.zeros(bs, dtype=torch.float32, device=device)
+    path_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
+    valid = torch.ones(bs, dtype=torch.bool, device=device)
+    path_pairs = []
+
+    for _ in range(spec_steps):
+        next_cols = retrive_next_token[batch_idx, cur_cols]
+        step_valid = next_cols >= 0
+        safe_next_cols = torch.where(step_valid, next_cols, cur_cols)
+        token_ids = candidates[batch_idx, safe_next_cols].long()
+        step_log_probs = log_probs[batch_idx, cur_cols, token_ids].float()
+        score_sums += torch.where(
+            step_valid, step_log_probs, torch.zeros_like(step_log_probs)
+        )
+        path_lengths += step_valid.to(torch.int32)
+        valid &= step_valid
+        path_pairs.append((cur_cols, safe_next_cols))
+        cur_cols = safe_next_cols
+
+    valid &= path_lengths == spec_steps
+    mean_log_probs = torch.where(
+        path_lengths > 0,
+        score_sums / path_lengths.clamp_min(1).float(),
+        torch.full_like(score_sums, float("-inf")),
+    )
+    scores = torch.where(
+        valid, torch.exp(mean_log_probs), torch.zeros_like(mean_log_probs)
+    )
+    return scores, mean_log_probs, path_lengths, valid, path_pairs, cur_cols
+
+
+def _compute_linear_draft_scores_parallel(
+    candidates: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    log_probs: torch.Tensor,
+    spec_steps: int,
+):
+    bs = candidates.shape[0]
+    device = candidates.device
+    batch_idx = torch.arange(bs, device=device)
+
+    if spec_steps == 0:
+        path_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
+        valid = torch.ones(bs, dtype=torch.bool, device=device)
+        mean_log_probs = torch.full((bs,), float("-inf"), device=device)
+        scores = torch.zeros(bs, dtype=torch.float32, device=device)
+        final_cols = torch.zeros(bs, dtype=torch.long, device=device)
+        return scores, mean_log_probs, path_lengths, valid, [], final_cols
+
+    prev_cols = torch.arange(spec_steps, dtype=torch.long, device=device)
+    prev_cols_batch = prev_cols.unsqueeze(0).expand(bs, -1)
+    direct_next_cols = retrive_next_token[:, :spec_steps].long()
+    expected_next_cols = prev_cols_batch + 1
+    direct_valid = (direct_next_cols >= 0) & (direct_next_cols == expected_next_cols)
+
+    # In the linear topk=1 layout, the only path that can be force-accepted is
+    # the prefix chain 0 -> 1 -> ... -> spec_steps. This cumulative mask freezes
+    # scoring after the first missing link without pointer-chasing in Python.
+    prefix_valid = direct_valid.to(torch.int32).cumprod(dim=1).bool()
+    safe_next_cols = torch.where(direct_valid, direct_next_cols, prev_cols_batch)
+    token_ids = candidates.gather(1, safe_next_cols).long()
+    step_log_probs = log_probs[
+        batch_idx.unsqueeze(1),
+        prev_cols_batch,
+        token_ids,
+    ].float()
+
+    score_sums = torch.where(
+        prefix_valid, step_log_probs, torch.zeros_like(step_log_probs)
+    ).sum(dim=1)
+    path_lengths = prefix_valid.sum(dim=1).to(torch.int32)
+    valid = path_lengths == spec_steps
+    mean_log_probs = torch.where(
+        path_lengths > 0,
+        score_sums / path_lengths.clamp_min(1).float(),
+        torch.full_like(score_sums, float("-inf")),
+    )
+    scores = torch.where(
+        valid, torch.exp(mean_log_probs), torch.zeros_like(mean_log_probs)
+    )
+    final_cols = path_lengths.to(torch.long)
+    frozen_prev_cols = torch.minimum(prev_cols_batch, final_cols.unsqueeze(1))
+    frozen_next_cols = torch.minimum(expected_next_cols, final_cols.unsqueeze(1))
+    path_pairs = [
+        (frozen_prev_cols[:, i], frozen_next_cols[:, i]) for i in range(spec_steps)
+    ]
+    return scores, mean_log_probs, path_lengths, valid, path_pairs, final_cols
+
+
+def _record_dflash_lossy_batch(
+    batch: ModelWorkerBatch,
+    scores: torch.Tensor,
+    mean_log_probs: torch.Tensor,
+    path_lengths: torch.Tensor,
+    normal_accept_length: torch.Tensor,
+    threshold_pass: torch.Tensor,
+    forced_accept: torch.Tensor,
+):
+    server_args = get_global_server_args()
+    scores_cpu = scores.detach().float().cpu().tolist()
+    mean_log_probs_cpu = mean_log_probs.detach().float().cpu().tolist()
+    path_lengths_cpu = path_lengths.detach().cpu().tolist()
+    normal_accept_cpu = normal_accept_length.detach().cpu().tolist()
+    threshold_pass_cpu = threshold_pass.detach().cpu().tolist()
+    forced_accept_cpu = forced_accept.detach().cpu().tolist()
+
+    server_args.dflash_lossy_spec_score_count += len(scores_cpu)
+    server_args.dflash_lossy_spec_score_sum += float(sum(scores_cpu))
+    server_args.dflash_lossy_spec_forced_accept_count += int(sum(forced_accept_cpu))
+    histogram = server_args.dflash_lossy_spec_score_histogram or [0] * 10
+    for score in scores_cpu:
+        bucket = min(9, max(0, int(score * 10)))
+        histogram[bucket] += 1
+    server_args.dflash_lossy_spec_score_histogram = histogram
+
+    output_path = server_args.dflash_lossy_spec_calibration_output
+    if not output_path:
+        return
+
+    parent_dir = os.path.dirname(output_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    reqs = batch.reqs or []
+    with open(output_path, "a", encoding="utf-8") as fout:
+        for i, score in enumerate(scores_cpu):
+            rid = getattr(reqs[i], "rid", "") if i < len(reqs) else ""
+            record = {
+                "time": time.time(),
+                "rid": rid,
+                "mode": server_args.dflash_lossy_spec_mode,
+                "threshold": server_args.dflash_lossy_spec_threshold,
+                "score": score,
+                "mean_logprob": mean_log_probs_cpu[i],
+                "path_len": int(path_lengths_cpu[i]),
+                "normal_accept_length": int(normal_accept_cpu[i]),
+                "threshold_pass": bool(threshold_pass_cpu[i]),
+                "forced_accept": bool(forced_accept_cpu[i]),
+                "spec_steps": int(getattr(batch.spec_info, "spec_steps", -1)),
+                "draft_token_num": int(getattr(batch.spec_info, "draft_token_num", -1)),
+                "topk": int(getattr(batch.spec_info, "topk", -1)),
+            }
+            fout.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _force_accept_linear_draft(
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    path_pairs,
+    final_cols: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    force_mask: torch.Tensor,
+    spec_steps: int,
+):
+    rows = torch.nonzero(force_mask, as_tuple=False).flatten()
+    if rows.numel() == 0:
+        return
+
+    for step, (prev_cols, next_cols) in enumerate(path_pairs):
+        prev_retrive = retrive_index[rows, prev_cols[rows]].long()
+        predict[prev_retrive] = candidates[rows, next_cols[rows]].to(torch.int32)
+        accept_index[rows, step] = prev_retrive.to(torch.int32)
+
+    final_retrive = retrive_index[rows, final_cols[rows]].long()
+    predict[final_retrive] = bonus_token_ids[rows].to(torch.int32)
+    accept_index[rows, spec_steps] = final_retrive.to(torch.int32)
+    accept_length[rows] = spec_steps
 
 
 @triton.jit
@@ -295,11 +485,15 @@ class EagleVerifyInputV2Mixin:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
+        linear_lossy_enabled = _dflash_lossy_mode_enabled()
+        target_predict_for_lossy = None
+        target_probs_for_lossy = None
 
         # Sample tokens
         if sampling_info.is_all_greedy or _is_npu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
+            target_predict_for_lossy = target_predict
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -333,6 +527,7 @@ class EagleVerifyInputV2Mixin:
                 ),
             )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+            target_probs_for_lossy = target_probs
             draft_probs = torch.zeros_like(target_probs)
 
             # coins for rejection sampling
@@ -357,6 +552,82 @@ class EagleVerifyInputV2Mixin:
                 threshold_single=get_global_server_args().speculative_accept_threshold_single,
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
+            )
+
+        if linear_lossy_enabled and self.topk == 1:
+            normal_accept_length = accept_length.clone()
+            if target_probs_for_lossy is None:
+                target_log_probs = F.log_softmax(next_token_logits, dim=-1).reshape(
+                    bs, self.draft_token_num, -1
+                )
+            else:
+                target_log_probs = torch.log(
+                    target_probs_for_lossy.clamp_min(
+                        torch.finfo(target_probs_for_lossy.dtype).tiny
+                    )
+                )
+
+            (
+                scores,
+                mean_log_probs,
+                path_lengths,
+                valid_paths,
+                path_pairs,
+                final_cols,
+            ) = _compute_linear_draft_scores_parallel(
+                candidates,
+                self.retrive_next_token,
+                target_log_probs,
+                self.spec_steps,
+            )
+            threshold_pass = (
+                valid_paths
+                & (scores >= get_global_server_args().dflash_lossy_spec_threshold)
+            )
+
+            if target_probs_for_lossy is None:
+                batch_idx = torch.arange(bs, device=device)
+                bonus_token_ids = target_predict_for_lossy[batch_idx, final_cols].to(
+                    torch.int32
+                )
+            else:
+                batch_idx = torch.arange(bs, device=device)
+                final_probs = target_probs_for_lossy[batch_idx, final_cols]
+                positions = None
+                if self.positions.numel() >= bs * self.draft_token_num:
+                    positions = self.positions.reshape(bs, self.draft_token_num)[
+                        batch_idx, final_cols
+                    ]
+                bonus_token_ids = sampling_from_probs_torch(
+                    final_probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
+
+            if get_global_server_args().dflash_lossy_spec_mode == "accept":
+                forced_accept = threshold_pass
+            else:
+                forced_accept = torch.zeros_like(threshold_pass)
+            _record_dflash_lossy_batch(
+                batch,
+                scores,
+                mean_log_probs,
+                path_lengths,
+                normal_accept_length,
+                threshold_pass,
+                forced_accept,
+            )
+            _force_accept_linear_draft(
+                predict,
+                accept_index,
+                accept_length,
+                candidates,
+                self.retrive_index,
+                path_pairs,
+                final_cols,
+                bonus_token_ids,
+                forced_accept,
+                self.spec_steps,
             )
 
         if SIMULATE_ACC_LEN > 0:

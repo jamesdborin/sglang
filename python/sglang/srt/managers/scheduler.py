@@ -2560,6 +2560,16 @@ class Scheduler(
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
 
+        dflash_score_count = ret.get("dflash_lossy_spec_score_count", 0)
+        if dflash_score_count > 0:
+            ret["dflash_lossy_spec_avg_score"] = (
+                ret.get("dflash_lossy_spec_score_sum", 0.0) / dflash_score_count
+            )
+            ret["dflash_lossy_spec_forced_accept_rate"] = (
+                ret.get("dflash_lossy_spec_forced_accept_count", 0)
+                / dflash_score_count
+            )
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
@@ -2575,6 +2585,9 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "dflash_lossy_spec_mode",
+                "dflash_lossy_spec_threshold",
+                "dflash_lossy_spec_calibration_output",
             ]
         )
 
@@ -2592,6 +2605,42 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "dflash_lossy_spec_mode" and v not in {
+                "off",
+                "calibrate",
+                "accept",
+            }:
+                logging.warning(
+                    f"Updating {k} to {v} is rejected because it must be one of off, calibrate, accept."
+                )
+                if_success = False
+                break
+            elif k == "dflash_lossy_spec_threshold" and (
+                not isinstance(v, (int, float)) or not (0.0 <= v <= 1.0)
+            ):
+                logging.warning(
+                    f"Updating {k} to {v} is rejected because it must be between 0 and 1."
+                )
+                if_success = False
+                break
+
+        if if_success:
+            next_mode = server_args_dict.get(
+                "dflash_lossy_spec_mode",
+                get_global_server_args().dflash_lossy_spec_mode,
+            )
+            if next_mode != "off" and (
+                get_global_server_args().speculative_algorithm != "STANDALONE"
+                or get_global_server_args().speculative_eagle_topk != 1
+                or self.spec_algorithm.is_none()
+                or not self.enable_overlap
+                or not get_global_server_args().device.startswith("cuda")
+            ):
+                logging.warning(
+                    "Updating dflash_lossy_spec_mode is rejected because this "
+                    "server is not running the linear DFlash STANDALONE spec path."
+                )
+                if_success = False
 
         if if_success:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
@@ -2602,9 +2651,14 @@ class Scheduler(
             self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
+            if any(k.startswith("dflash_lossy_spec_") for k in server_args_dict):
+                get_global_server_args().dflash_lossy_spec_score_count = 0
+                get_global_server_args().dflash_lossy_spec_score_sum = 0.0
+                get_global_server_args().dflash_lossy_spec_forced_accept_count = 0
+                get_global_server_args().dflash_lossy_spec_score_histogram = [0] * 10
             logger.info(f"Global server args updated! {get_global_server_args()=}")
         return SetInternalStateReqOutput(
-            updated=True,
+            updated=if_success,
             server_args=vars(get_global_server_args()),
         )
 

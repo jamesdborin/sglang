@@ -259,6 +259,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-num-draft-tokens` | The number of tokens sampled from the draft model in Speculative Decoding. | `None` | Type: int |
 | `--speculative-accept-threshold-single` | Accept a draft token if its probability in the target model is greater than this threshold. | `1.0` | Type: float |
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | `1.0` | Type: float |
+| `--dflash-lossy-spec-mode` | Enable lossy linear DFlash speculative decoding. Only valid for STANDALONE spec v2 with topk=1. | `off` | `off`, `calibrate`, `accept` |
+| `--dflash-lossy-spec-threshold` | Accept the full linear DFlash draft chunk when exp(mean target logprob) is at least this threshold. | `1.0` | Type: float |
+| `--dflash-lossy-spec-calibration-output` | Optional JSONL file that receives DFlash lossy calibration scores. | `None` | Type: str |
 | `--speculative-token-map` | The path of the draft model's small vocab table. | `None` | Type: str |
 | `--speculative-attention-mode` | Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'. | `prefill` | `prefill`, `decode` |
 | `--speculative-moe-runner-backend` | MOE backend for EAGLE speculative decoding, see --moe-runner-backend for options. Same as moe runner backend if unset. | `None` | |

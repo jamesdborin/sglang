@@ -424,6 +424,9 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    dflash_lossy_spec_mode: Literal["off", "calibrate", "accept"] = "off"
+    dflash_lossy_spec_threshold: float = 1.0
+    dflash_lossy_spec_calibration_output: Optional[str] = None
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -2178,6 +2181,58 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        self.dflash_lossy_spec_score_count = getattr(
+            self, "dflash_lossy_spec_score_count", 0
+        )
+        self.dflash_lossy_spec_score_sum = getattr(
+            self, "dflash_lossy_spec_score_sum", 0.0
+        )
+        self.dflash_lossy_spec_forced_accept_count = getattr(
+            self, "dflash_lossy_spec_forced_accept_count", 0
+        )
+        self.dflash_lossy_spec_score_histogram = getattr(
+            self, "dflash_lossy_spec_score_histogram", None
+        ) or [0] * 10
+
+        if not 0.0 <= self.dflash_lossy_spec_threshold <= 1.0:
+            raise ValueError(
+                "--dflash-lossy-spec-threshold must be between 0 and 1."
+            )
+
+        if self.dflash_lossy_spec_mode != "off":
+            if not self.device.startswith("cuda"):
+                raise ValueError(
+                    "--dflash-lossy-spec-mode currently only supports CUDA."
+                )
+            if self.speculative_algorithm != "STANDALONE":
+                raise ValueError(
+                    "--dflash-lossy-spec-mode is only supported on the linear "
+                    "DFlash path, represented in this checkout as "
+                    "--speculative-algorithm STANDALONE."
+                )
+            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                raise ValueError(
+                    "--dflash-lossy-spec-mode requires SGLANG_ENABLE_SPEC_V2=True."
+                )
+            if self.enable_multi_layer_eagle:
+                raise ValueError(
+                    "--dflash-lossy-spec-mode does not support multi-layer EAGLE."
+                )
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "--dflash-lossy-spec-mode only supports linear speculative "
+                    "decoding with --speculative-eagle-topk 1."
+                )
+            if (
+                self.speculative_num_steps is not None
+                and self.speculative_num_draft_tokens is not None
+                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+            ):
+                raise ValueError(
+                    "--dflash-lossy-spec-mode requires "
+                    "--speculative-num-draft-tokens == --speculative-num-steps + 1."
+                )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3486,6 +3541,25 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--dflash-lossy-spec-mode",
+            type=str,
+            choices=["off", "calibrate", "accept"],
+            help="Enable lossy linear DFlash speculative decoding. This is only valid for STANDALONE spec v2 with topk=1.",
+            default=ServerArgs.dflash_lossy_spec_mode,
+        )
+        parser.add_argument(
+            "--dflash-lossy-spec-threshold",
+            type=float,
+            help="Accept the full linear DFlash draft chunk when exp(mean target logprob) is at least this threshold.",
+            default=ServerArgs.dflash_lossy_spec_threshold,
+        )
+        parser.add_argument(
+            "--dflash-lossy-spec-calibration-output",
+            type=str,
+            help="Optional JSONL file that receives DFlash lossy calibration scores.",
+            default=ServerArgs.dflash_lossy_spec_calibration_output,
         )
         parser.add_argument(
             "--speculative-token-map",
