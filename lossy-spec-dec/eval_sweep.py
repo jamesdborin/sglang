@@ -68,9 +68,9 @@ def merged_server_state(server_info: Dict[str, Any]) -> Dict[str, Any]:
 def validate_dflash_linear(server_info: Dict[str, Any]):
     state = merged_server_state(server_info)
     errors = []
-    if state.get("speculative_algorithm") != "STANDALONE":
-        errors.append("speculative_algorithm is not STANDALONE")
-    if state.get("speculative_eagle_topk") != 1:
+    if state.get("speculative_algorithm") != "DFLASH":
+        errors.append("speculative_algorithm is not DFLASH")
+    if state.get("speculative_eagle_topk") not in (None, 1):
         errors.append("speculative_eagle_topk is not 1")
     if state.get("disable_overlap_schedule") is True:
         errors.append("spec v2 overlap scheduling is not enabled")
@@ -252,11 +252,9 @@ def launch_server(args, calibration_output: Path):
         "--port",
         str(args.port),
         "--speculative-algorithm",
-        "STANDALONE",
+        "DFLASH",
         "--speculative-draft-model-path",
         args.speculative_draft_model_path,
-        "--speculative-eagle-topk",
-        "1",
         "--dflash-lossy-spec-mode",
         "calibrate" if args.mode == "calibrate" else "accept",
         "--dflash-lossy-spec-threshold",

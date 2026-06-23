@@ -10,6 +10,7 @@ uv pip install --python "$VENV_DIR/bin/python" -e "$ROOT_DIR/python"
 cat <<EOF
 Calibration environment is ready:
   source "$VENV_DIR/bin/activate"
+  export LD_LIBRARY_PATH="$VENV_DIR/lib/python3.12/site-packages/nvidia/cu13/lib:\${LD_LIBRARY_PATH:-}"
 
 Example:
   python "$ROOT_DIR/lossy-spec-dec/calibrate_dataset.py" \\
