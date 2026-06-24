@@ -1,6 +1,8 @@
+import json
 import logging
 import math
 from copy import deepcopy
+from pathlib import Path
 from typing import List, Optional
 
 import torch
@@ -1157,6 +1159,76 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._warned_sampling_fallback = True
 
+    def _record_lossy_spec_scores(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        normal_accept_len: torch.Tensor,
+        request_ids: Optional[List[str]] = None,
+    ) -> Optional[torch.Tensor]:
+        """Record DFlash chunk perplexities and return rows that pass threshold."""
+        global_args = get_global_server_args()
+        mode = global_args.dflash_lossy_spec_mode
+        if mode == "off":
+            return None
+
+        bs, block_size = candidates.shape
+        if bs <= 0 or block_size <= 1:
+            return None
+
+        # Row t predicts the token at t + 1, so score only draft proposals and
+        # exclude the current token and final bonus row.
+        logits = next_token_logits.view(bs, block_size, -1)[:, : block_size - 1, :]
+        labels = candidates[:, 1:].to(torch.long)
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        token_log_probs = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        mean_log_probs = token_log_probs.mean(dim=1)
+        scores = torch.exp(-mean_log_probs)
+        threshold = float(global_args.dflash_lossy_spec_threshold)
+        threshold_pass = scores <= threshold
+
+        scores_cpu = scores.detach().cpu()
+        mean_log_probs_cpu = mean_log_probs.detach().cpu()
+        normal_accept_len_cpu = normal_accept_len.detach().cpu()
+        threshold_pass_cpu = threshold_pass.detach().cpu()
+
+        score_values = [float(score) for score in scores_cpu.tolist()]
+        global_args.dflash_lossy_spec_score_count += len(score_values)
+        global_args.dflash_lossy_spec_score_sum += sum(score_values)
+        if mode == "accept":
+            global_args.dflash_lossy_spec_forced_accept_count += sum(
+                1 for passed in threshold_pass_cpu.tolist() if bool(passed)
+            )
+        histogram = global_args.dflash_lossy_spec_score_histogram
+        for score in score_values:
+            bucket = f"{math.floor(score * 10) / 10:.1f}"
+            histogram[bucket] = histogram.get(bucket, 0) + 1
+
+        output_path = global_args.dflash_lossy_spec_calibration_output
+        if output_path and self.tp_rank == 0:
+            path = Path(output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fout:
+                for i, score in enumerate(score_values):
+                    row = {
+                        "score": score,
+                        "perplexity": score,
+                        "mean_logprob": float(mean_log_probs_cpu[i].item()),
+                        "normal_accept_len": int(normal_accept_len_cpu[i].item()),
+                        "threshold": threshold,
+                        "threshold_pass": bool(threshold_pass_cpu[i].item()),
+                        "forced_accept": bool(
+                            mode == "accept" and threshold_pass_cpu[i].item()
+                        ),
+                        "block_size": int(block_size),
+                    }
+                    if request_ids is not None and i < len(request_ids):
+                        row["rid"] = request_ids[i]
+                    fout.write(json.dumps(row, sort_keys=True) + "\n")
+
+        return threshold_pass
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -1574,7 +1646,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             if int(self.block_size) > 1:
                 out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
             out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            out_tokens.scatter_(
+                1,
+                accept_len.to(torch.int64)[:, None],
+                bonus.to(out_tokens.dtype)[:, None],
+            )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
@@ -1620,7 +1696,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                         )
                     out_tokens[:, int(self.block_size) - 1].fill_(0)
                     out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                        1,
+                        accept_len.to(torch.int64)[:, None],
+                        bonus.to(out_tokens.dtype)[:, None],
                     )
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
@@ -1635,8 +1713,47 @@ class DFlashWorkerV2(BaseSpecWorker):
                     out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
                 out_tokens[:, int(self.block_size) - 1].fill_(0)
                 out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    1,
+                    accept_len.to(torch.int64)[:, None],
+                    bonus.to(out_tokens.dtype)[:, None],
                 )
+
+        request_ids = [req.rid for req in model_worker_batch.reqs]
+        threshold_pass = self._record_lossy_spec_scores(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            normal_accept_len=accept_len,
+            request_ids=request_ids,
+        )
+        if (
+            threshold_pass is not None
+            and get_global_server_args().dflash_lossy_spec_mode == "accept"
+        ):
+            forced_mask = threshold_pass.to(device=device)
+            if bool(forced_mask.any().item()):
+                forced_accept_len = torch.full_like(accept_len, int(self.block_size) - 1)
+                accept_len = torch.where(forced_mask, forced_accept_len, accept_len)
+                commit_lens = accept_len.to(torch.int32) + 1
+                if sampling_info is not None and not sampling_info.is_all_greedy:
+                    forced_bonus = torch.argmax(
+                        logits_output.next_token_logits.view(
+                            bs, int(self.block_size), -1
+                        )[:, int(self.block_size) - 1, :],
+                        dim=-1,
+                    ).to(torch.int64)
+                    bonus = torch.where(forced_mask, forced_bonus, bonus)
+                out_tokens = torch.empty(
+                    (bs, int(self.block_size)), dtype=torch.int64, device=device
+                )
+                if int(self.block_size) > 1:
+                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+                out_tokens[:, int(self.block_size) - 1].fill_(0)
+                out_tokens.scatter_(
+                    1,
+                    accept_len.to(torch.int64)[:, None],
+                    bonus.to(out_tokens.dtype)[:, None],
+                )
+                new_seq_lens = None
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
