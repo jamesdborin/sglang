@@ -16,10 +16,28 @@
 - Then I want to repeatedly raise the threshold and show quality decreasing while speed increases.
 
 ## Guessed results
-![tok-threshold](./images/tok-vs-threshold.png)
-![benchmark-threshold](./images/benchmark-vs-threshold.png)
-![tok-benchmark](./images/benchmark-vs-tok.png)
+![tok-threshold](./images/tok-vs-threshold.svg)
+![benchmark-threshold](./images/benchmark-vs-threshold.svg)
+![tok-benchmark](./images/benchmark-vs-tok.svg)
 
-- As you decrease threshold (make it more likely to accept), your speed to smoothly interpolate from speculative decoding speed to speculator speed
-- As you decrease threshold, your benchmarks should smoothly interpolate from the verifier to the speculator
-- You hopefully have some threshold with small benchmarks drops and large tok/s gains.
+- The first plot shows throughput as a function of the perplexity threshold. A threshold of `1.0` only force-accepts perfect chunks; raising the threshold makes the lossy accept rule more permissive, so throughput should move from normal speculative decoding toward the draft model's speed.
+- The second plot shows benchmark quality as a function of the same threshold. As the threshold rises, benchmark scores should move from verifier-like quality toward speculator-like quality.
+- The third plot puts benchmark score directly against throughput. This is the tradeoff curve: useful thresholds are the points that keep benchmark score close to baseline while buying a large tokens-per-second gain.
+
+Collect the data with:
+
+```bash
+.venv-lossy-calibrate/bin/python lossy-spec-dec/run_threshold_eval_sweep.py \
+  --thresholds 1,1.001,1.01,1.1,2,10,100 \
+  --speculative-num-draft-tokens 5 \
+  --server-args '--disable-cuda-graph' \
+  --nemo-command-template 'YOUR_EVAL_COMMAND_WITH_{task}_{openai_base_url}_{model_id}_{output_dir}'
+```
+
+Then create the figures with:
+
+```bash
+.venv-lossy-calibrate/bin/python lossy-spec-dec/plot_threshold_eval_sweep.py \
+  --input lossy-spec-dec/runs/threshold-eval/<run-id>/runs.jsonl \
+  --output-dir lossy-spec-dec/images
+```

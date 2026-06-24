@@ -113,6 +113,11 @@ def finite_values(records: list[dict[str, Any]], key: str) -> list[float]:
     return values
 
 
+def calibration_perplexities(records: list[dict[str, Any]]) -> list[float]:
+    values = finite_values(records, "score")
+    return values if values else finite_values(records, "perplexity")
+
+
 def make_histogram(values: list[float], bins: int) -> list[tuple[float, float, int]]:
     if not values:
         return []
@@ -179,7 +184,9 @@ def build_server_args(args: argparse.Namespace, calibration_output: Path) -> Sim
 
 def run_calibration(args: argparse.Namespace) -> Path:
     eval_sweep = load_eval_sweep()
-    run_dir = args.output_dir / args.dataset / time.strftime("%Y%m%d-%H%M%S")
+    run_dir = args.run_dir or args.output_dir / args.dataset / time.strftime(
+        "%Y%m%d-%H%M%S"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     calibration_output = run_dir / "calibration.jsonl"
     prompts_path = run_dir / "prompts.jsonl"
@@ -211,7 +218,7 @@ def run_calibration(args: argparse.Namespace) -> Path:
                 process.kill()
 
     records = list(iter_records(calibration_output))
-    perplexities = finite_values(records, "perplexity")
+    perplexities = calibration_perplexities(records)
     mean_logprobs = finite_values(records, "mean_logprob")
 
     print(f"\nWrote calibration records: {calibration_output}")
@@ -234,6 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "lossy-spec-dec" / "runs" / "calibration")
+    parser.add_argument("--run-dir", type=Path, help="Use an explicit output run directory.")
     parser.add_argument("--threshold", type=float, default=1.0)
     parser.add_argument("--speculative-num-steps", type=int, default=3)
     parser.add_argument("--speculative-num-draft-tokens", type=int, default=4)

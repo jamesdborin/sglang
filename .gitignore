@@ -187,6 +187,13 @@ tl_out/
 *.png
 *.pdf
 
+# Lossy-spec-dec experiment outputs
+lossy-spec-dec/runs/
+lossy-spec-dec/images/tok-vs-threshold.svg
+lossy-spec-dec/images/benchmark-vs-threshold.svg
+lossy-spec-dec/images/benchmark-vs-tok.svg
+lossy-spec-dec/images/threshold_plot_data.json
+
 # personnal
 work_dirs/
 *.csv
