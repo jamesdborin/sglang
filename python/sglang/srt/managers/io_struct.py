@@ -283,7 +283,7 @@ class GenerateReqInput:
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
     # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
+    routed_dp_rank: Optional[Union[List[Optional[int]], int]] = None
     # Deprecated alias for `routed_dp_rank`, still accepted because
     # sgl-model-gateway's dp-aware mode injects this spelling into every
     # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
@@ -560,6 +560,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_routed_dp_rank(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -821,6 +822,26 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_routed_dp_rank(self, num):
+        """Normalize an optional per-request DP route for native batches."""
+        if self.routed_dp_rank is None:
+            return
+        if isinstance(self.routed_dp_rank, int):
+            self.routed_dp_rank = [self.routed_dp_rank] * num
+        elif isinstance(self.routed_dp_rank, list):
+            if len(self.routed_dp_rank) != self.batch_size:
+                raise ValueError(
+                    "The length of routed_dp_rank should be equal to the batch size."
+                )
+            if any(
+                rank is not None and not isinstance(rank, int)
+                for rank in self.routed_dp_rank
+            ):
+                raise ValueError("Every routed_dp_rank should be an integer or None.")
+            self.routed_dp_rank = self.routed_dp_rank * self.parallel_sample_num
+        else:
+            raise ValueError("routed_dp_rank should be a list or an integer.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -943,7 +964,11 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            routed_dp_rank=self.routed_dp_rank,
+            routed_dp_rank=(
+                self.routed_dp_rank[i]
+                if isinstance(self.routed_dp_rank, list)
+                else self.routed_dp_rank
+            ),
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,

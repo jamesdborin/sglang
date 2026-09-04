@@ -935,6 +935,9 @@ class Envs:
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    # Select the external dw-megakernels implementation for MegaMoE. The
+    # default keeps SGLang's built-in DeepGEMM path unchanged.
+    SGLANG_MEGAMOE_KERNEL_BACKEND = EnvStr("deep_gemm")
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)

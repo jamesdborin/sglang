@@ -159,7 +159,27 @@ class MoeRunner:
                 a2a_backend_name, runner_backend_name
             )
 
-            if self.runner_core is None and self.fused_func is None:
+            external_megamoe_intercept = False
+            if (
+                self.runner_core is None
+                and self.fused_func is None
+                and get_moe_a2a_backend().is_megamoe()
+                and runner_backend.is_flashinfer_cutedsl()
+            ):
+                # The external dw NVFP4 MegaMoE path intercepts the whole MoE
+                # forward before MoeRunner.run. CuteDSL is selected only so
+                # ModelOpt retains the checkpoint's raw NVFP4 weight layout.
+                from sglang.srt.layers.moe.dw_megakernels import (
+                    use_dw_nvfp4_mega_moe,
+                )
+
+                external_megamoe_intercept = use_dw_nvfp4_mega_moe()
+
+            if (
+                self.runner_core is None
+                and self.fused_func is None
+                and not external_megamoe_intercept
+            ):
                 raise NotImplementedError(
                     f"Runner backend {runner_backend} requires a fused func for a2a backend "
                     f"{a2a_backend_name}, but none is registered."

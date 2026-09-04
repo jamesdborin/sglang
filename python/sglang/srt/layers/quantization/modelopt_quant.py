@@ -2505,6 +2505,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             layer._w13_deinterleaved = True
 
+        from sglang.srt.layers.moe.dw_megakernels import (
+            build_dw_nvfp4_experts_weights,
+            use_dw_nvfp4_mega_moe,
+        )
+
+        if use_dw_nvfp4_mega_moe():
+            build_dw_nvfp4_experts_weights(layer)
+            return
+
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = getattr(

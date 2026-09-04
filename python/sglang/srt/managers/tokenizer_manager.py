@@ -792,14 +792,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
-                )
+            routed_dp_ranks = (
+                obj.routed_dp_rank
+                if isinstance(obj.routed_dp_rank, list)
+                else [obj.routed_dp_rank]
+            )
+            for routed_dp_rank in routed_dp_ranks:
+                if routed_dp_rank is None:
+                    continue
+                if dp_size <= 1 and routed_dp_rank == 0:
+                    logger.debug(
+                        f"routed_dp_rank={routed_dp_rank} is ignored because "
+                        f"dp_size={dp_size}"
+                    )
+                elif routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+                    raise ValueError(
+                        f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
+                    )
 
         self._init_req_state(obj, request)
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)

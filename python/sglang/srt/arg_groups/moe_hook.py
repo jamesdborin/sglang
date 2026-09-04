@@ -67,13 +67,20 @@ def handle_moe_kernel_config(server_args: Any):
             1,
             cfg.tp_size,
         ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-        assert view.moe_a2a_backend in [
-            "none",
-            "deepep",
-            "flashinfer",
-        ], (
-            f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
-            f"got '{view.moe_a2a_backend}'."
+        supported_a2a_backends = ["none", "deepep", "flashinfer"]
+        external_mega_moe = (
+            envs.SGLANG_MEGAMOE_KERNEL_BACKEND.get().strip().lower()
+            in {"dw", "dw-megakernels", "dw_megakernels", "dw_nvfp4"}
+        )
+        if external_mega_moe:
+            # flashinfer_cutedsl only supplies ModelOpt's raw NVFP4 weight
+            # layout in this configuration. The external backend bypasses its
+            # runner and owns dispatch/GEMMs/combine through MegaMoE.
+            supported_a2a_backends.append("megamoe")
+        assert view.moe_a2a_backend in supported_a2a_backends, (
+            "flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', "
+            f"or 'flashinfer' (plus 'megamoe' for dw NVFP4), got "
+            f"'{view.moe_a2a_backend}'."
         )
         if view.moe_a2a_backend == "deepep" and (
             view.quantization == "nvfp4_online"

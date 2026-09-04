@@ -125,7 +125,14 @@ def _get_mega_moe_symm_buffer(
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    if not getattr(moe.experts, "_mega_moe_weights_built", False):
+    from sglang.srt.layers.moe.dw_megakernels import use_dw_nvfp4_mega_moe
+
+    weights_flag = (
+        "_dw_nvfp4_weights_built"
+        if use_dw_nvfp4_mega_moe()
+        else "_mega_moe_weights_built"
+    )
+    if not getattr(moe.experts, weights_flag, False):
         return False
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
@@ -139,6 +146,13 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if use_dw_nvfp4_mega_moe() and max_tokens_per_rank > cap:
+        raise RuntimeError(
+            f"dw NVFP4 MegaMoE requires max tokens per rank <= {cap}, got "
+            f"{max_tokens_per_rank}; raise "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK or shrink "
+            "cuda_graph_max_bs/chunked_prefill_size"
+        )
     return max_tokens_per_rank <= cap
 
 
@@ -186,8 +200,6 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
-    import deep_gemm
-
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
@@ -214,10 +226,7 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
-    ep_group = get_moe_ep_group().device_group
-    num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
-    intermediate_size = moe.config.moe_intermediate_size
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -228,6 +237,38 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
+    if num_tokens > 0:
+        topk_ids_in = topk_ids.to(torch.int32)
+        topk_weights_in = topk_weights.to(torch.float32)
+    else:
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    from sglang.srt.layers.moe.dw_megakernels import (
+        run_dw_nvfp4_mega_moe,
+        use_dw_nvfp4_mega_moe,
+    )
+
+    if use_dw_nvfp4_mega_moe():
+        phase = (
+            "decode"
+            if forward_batch is not None and forward_batch.forward_mode.is_decode()
+            else "prefill"
+        )
+        return run_dw_nvfp4_mega_moe(
+            moe,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            num_tokens,
+            phase=phase,
+        )
+
+    import deep_gemm
+
+    ep_group = get_moe_ep_group().device_group
+    num_experts = moe.experts.num_experts
+    intermediate_size = moe.config.moe_intermediate_size
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -236,13 +277,6 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
-
-    if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
-        topk_weights_in = topk_weights.to(torch.float32)
-    else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
-        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
     if _device_sm == 90:
         return run_sm90_mega_routed(
